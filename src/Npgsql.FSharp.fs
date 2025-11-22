@@ -131,7 +131,7 @@ module Sql =
                 match uri.UserInfo.Split ':' with
                 | [| username; password|] ->
                   [ ("Username", username); ("Password", password) ]
-                | otherwise -> [ ]
+                | _otherwise -> [ ]
             elif not (String.IsNullOrWhiteSpace uri.UserInfo) then
                 ["Username", uri.UserInfo ]
             else
@@ -140,7 +140,7 @@ module Sql =
         let extractDatabase (uri: Uri) =
             match uri.LocalPath.Split '/' with
             | [| ""; databaseName |] -> Some ("Database", databaseName)
-            | otherwise -> None
+            | _otherwise -> None
 
         let extractPort (uri: Uri) =
             match uri.Port with
@@ -159,7 +159,7 @@ module Sql =
             | "Password" -> { config with Password = Some value }
             | "Database" -> { config with Database = value }
             | "Port" -> { config with Port = Some (int value) }
-            | otherwise -> config
+            | _otherwise -> config
 
         (defaultConString(), uriParts)
         ||> List.fold updateConfig
@@ -189,8 +189,43 @@ module Sql =
             connection
 
         | Connection existingConnection -> existingConnection
-        | DataSource dataSource -> dataSource.OpenConnection()
+        | DataSource dataSource -> dataSource.CreateConnection()
         | Empty -> failwith "Could not create a connection from empty parameters."
+
+    let private closeConnectionAsync props (connection: NpgsqlConnection) =
+        match props.ExecutionTarget with
+        | ConnectionString _
+        | DataSource _ ->
+            connection.DisposeAsync()
+        | _ -> ValueTask.CompletedTask
+
+    let private executeAgainstDatabase props (f: SqlProps -> NpgsqlConnection -> Task<'a>) =
+        let catch t =
+            task {
+                try
+                    let! res = t
+                    return Choice1Of2 res
+                with ex ->
+                    return Choice2Of2 ex
+            }
+
+        task {
+            let connection = createConnection props
+
+            // Execute and get result
+            let! result =
+                f props connection
+                |> catch
+
+            // Close/Release connection
+            do! closeConnectionAsync props connection
+
+            // Handle result
+            match result with
+            | Choice1Of2 v -> return v
+            | Choice2Of2 ex ->
+                return raise ex
+        }
 
     let private makeCommand (props: SqlProps) (connection: NpgsqlConnection) =
         match props.ExecutionTarget with
@@ -348,40 +383,37 @@ module Sql =
             if List.isEmpty queries
             then return [ ]
             else
-            let connection = createConnection props
-            try
-                if not (connection.State.HasFlag ConnectionState.Open)
-                then do! connection.OpenAsync props.CancellationToken
-                use transaction = connection.BeginTransaction()
-                let affectedRowsByQuery = ResizeArray<int>()
-                for (query, parameterSets) in queries do
-                    if List.isEmpty parameterSets then
-                        use command = new NpgsqlCommand(query, connection, transaction)
-                        // detect whether the command has parameters
-                        // if that is the case, then don't execute it
-                        NpgsqlCommandBuilder.DeriveParameters(command)
-                        if command.Parameters.Count = 0 then
-                            let! affectedRows = command.ExecuteNonQueryAsync props.CancellationToken
-                            affectedRowsByQuery.Add affectedRows
-                        else
-                            // parameterized query won't execute
-                            // when the parameter set is empty
-                            affectedRowsByQuery.Add 0
-                    else
-                        use batch = new NpgsqlBatch(connection, transaction)
-                        for parameterSet in parameterSets do
-                            let batchCommand = new NpgsqlBatchCommand(query)
-                            populateBatchRow batchCommand parameterSet
-                            batch.BatchCommands.Add(batchCommand)
-                        let! affectedRows = batch.ExecuteNonQueryAsync props.CancellationToken
-                        affectedRowsByQuery.Add affectedRows
-                do! transaction.CommitAsync props.CancellationToken
-                return List.ofSeq affectedRowsByQuery
-            finally
-                match props.ExecutionTarget with
-                | ConnectionString _
-                | DataSource _ -> connection.Dispose()
-                | _ -> ()
+            return!
+                executeAgainstDatabase props (fun props connection ->
+                    task {
+                        if not (connection.State.HasFlag ConnectionState.Open)
+                        then do! connection.OpenAsync props.CancellationToken
+                        use transaction = connection.BeginTransaction()
+                        let affectedRowsByQuery = ResizeArray<int>()
+                        for (query, parameterSets) in queries do
+                            if List.isEmpty parameterSets then
+                                use command = new NpgsqlCommand(query, connection, transaction)
+                                // detect whether the command has parameters
+                                // if that is the case, then don't execute it
+                                NpgsqlCommandBuilder.DeriveParameters(command)
+                                if command.Parameters.Count = 0 then
+                                    let! affectedRows = command.ExecuteNonQueryAsync props.CancellationToken
+                                    affectedRowsByQuery.Add affectedRows
+                                else
+                                    // parameterized query won't execute
+                                    // when the parameter set is empty
+                                    affectedRowsByQuery.Add 0
+                            else
+                                use batch = new NpgsqlBatch(connection, transaction)
+                                for parameterSet in parameterSets do
+                                    let batchCommand = new NpgsqlBatchCommand(query)
+                                    populateBatchRow batchCommand parameterSet
+                                    batch.BatchCommands.Add(batchCommand)
+                                let! affectedRows = batch.ExecuteNonQueryAsync props.CancellationToken
+                                affectedRowsByQuery.Add affectedRows
+                        do! transaction.CommitAsync props.CancellationToken
+                        return List.ofSeq affectedRowsByQuery
+                    })
         }
 
     let execute (read: RowReader -> 't) (props: SqlProps) : 't list =
@@ -452,73 +484,65 @@ module Sql =
         task {
             if List.isEmpty props.SqlQuery
             then raise <| MissingQueryException "No query provided to execute. Please use Sql.query"
-            let connection = createConnection props
-            try
-                if not (connection.State.HasFlag ConnectionState.Open)
-                then do! connection.OpenAsync(props.CancellationToken)
-                use command = makeCommand props connection
-                do populateCmd command props
-                if props.NeedPrepare then
-                    do! command.PrepareAsync(props.CancellationToken)
-                use! reader = command.ExecuteReaderAsync props.CancellationToken
-                let postgresReader = unbox<NpgsqlDataReader> reader
-                let rowReader = RowReader(postgresReader)
-                let result = ResizeArray<'t>()
-                while reader.Read() do result.Add (read rowReader)
-                return List.ofSeq result
-            finally
-                match props.ExecutionTarget with
-                | ConnectionString _
-                | DataSource _ -> connection.Dispose()
-                | _ -> ()
+            return!
+                executeAgainstDatabase props (fun props connection ->
+                    task {
+                        if not (connection.State.HasFlag ConnectionState.Open)
+                        then do! connection.OpenAsync(props.CancellationToken)
+                        use command = makeCommand props connection
+                        do populateCmd command props
+                        if props.NeedPrepare then
+                            do! command.PrepareAsync(props.CancellationToken)
+                        use! reader = command.ExecuteReaderAsync props.CancellationToken
+                        let postgresReader = unbox<NpgsqlDataReader> reader
+                        let rowReader = RowReader(postgresReader)
+                        let result = ResizeArray<'t>()
+                        while! reader.ReadAsync(props.CancellationToken) do result.Add (read rowReader)
+                        return List.ofSeq result
+                    })
         }
 
     let iterAsync (perform: RowReader -> unit) (props: SqlProps) : Task =
         task {
             if List.isEmpty props.SqlQuery
             then raise <| MissingQueryException "No query provided to execute. Please use Sql.query"
-            let connection = createConnection props
-            try
-                if not (connection.State.HasFlag ConnectionState.Open)
-                then do! connection.OpenAsync(props.CancellationToken)
-                use command = makeCommand props connection
-                do populateCmd command props
-                if props.NeedPrepare then
-                    do! command.PrepareAsync(props.CancellationToken)
-                use! reader = command.ExecuteReaderAsync(props.CancellationToken)
-                let postgresReader = unbox<NpgsqlDataReader> reader
-                let rowReader = RowReader(postgresReader)
-                while reader.Read() do perform rowReader
-            finally
-                match props.ExecutionTarget with
-                | ConnectionString _
-                | DataSource _ -> connection.Dispose()
-                | _ -> ()
+            return!
+                executeAgainstDatabase props (fun props connection ->
+                    task {
+                        if not (connection.State.HasFlag ConnectionState.Open)
+                        then do! connection.OpenAsync(props.CancellationToken)
+                        use command = makeCommand props connection
+                        do populateCmd command props
+                        if props.NeedPrepare then
+                            do! command.PrepareAsync(props.CancellationToken)
+                        use! reader = command.ExecuteReaderAsync(props.CancellationToken)
+                        let postgresReader = unbox<NpgsqlDataReader> reader
+                        let rowReader = RowReader(postgresReader)
+                        while! reader.ReadAsync(props.CancellationToken) do perform rowReader
+                    })
         }
 
     let executeRowAsync (read: RowReader -> 't) (props: SqlProps) : Task<'t> =
         task {
             if List.isEmpty props.SqlQuery
             then raise <| MissingQueryException "No query provided to execute. Please use Sql.query"
-            let connection = createConnection props
-            try
-                if not (connection.State.HasFlag ConnectionState.Open)
-                then do! connection.OpenAsync(props.CancellationToken)
-                use command = makeCommand props connection
-                do populateCmd command props
-                if props.NeedPrepare then
-                    do! command.PrepareAsync(props.CancellationToken)
-                use! reader = command.ExecuteReaderAsync props.CancellationToken
-                let postgresReader = unbox<NpgsqlDataReader> reader
-                let rowReader = RowReader(postgresReader)
-                if reader.Read()
-                then return read rowReader
-                else return! raise <| NoResultsException "Expected at least one row to be returned from the result set. Instead it was empty"
-            finally
-                match props.ExecutionTarget with
-                | ConnectionString _
-                | DataSource _ -> connection.Dispose()
-                | _ -> ()
+            return!
+                executeAgainstDatabase props (fun props connection ->
+                    task {
+                        if not (connection.State.HasFlag ConnectionState.Open)
+                        then do! connection.OpenAsync(props.CancellationToken)
+                        use command = makeCommand props connection
+                        do populateCmd command props
+                        if props.NeedPrepare then
+                            do! command.PrepareAsync(props.CancellationToken)
+                        use! reader = command.ExecuteReaderAsync props.CancellationToken
+                        let postgresReader = unbox<NpgsqlDataReader> reader
+                        let rowReader = RowReader(postgresReader)
+
+                        match! reader.ReadAsync(props.CancellationToken) with
+                        | true -> return read rowReader
+                        | false -> return raise <| NoResultsException "Expected at least one row to be returned from the result set. Instead it was empty"
+                    })
         }
 
     /// Executes the query and returns the number of rows affected
@@ -540,25 +564,22 @@ module Sql =
             | _ -> ()
 
     /// Executes the query as asynchronously and returns the number of rows affected
-    let executeNonQueryAsync  (props: SqlProps) =
+    let executeNonQueryAsync (props: SqlProps) =
         task {
             if List.isEmpty props.SqlQuery
             then raise <| MissingQueryException "No query provided to execute. Please use Sql.query"
-            let connection = createConnection props
-            try
-                if not (connection.State.HasFlag ConnectionState.Open)
-                then do! connection.OpenAsync props.CancellationToken
-                use command = makeCommand props connection
-                populateCmd command props
-                if props.NeedPrepare then
-                    do! command.PrepareAsync(props.CancellationToken)
-                let! affectedRows = command.ExecuteNonQueryAsync props.CancellationToken
-                return affectedRows
-            finally
-                match props.ExecutionTarget with
-                | ConnectionString _
-                | DataSource _ -> connection.Dispose()
-                | _ -> ()
+            return!
+                executeAgainstDatabase props (fun props connection ->
+                    task {
+                        if not (connection.State.HasFlag ConnectionState.Open)
+                        then do! connection.OpenAsync props.CancellationToken
+                        use command = makeCommand props connection
+                        populateCmd command props
+                        if props.NeedPrepare then
+                            do! command.PrepareAsync(props.CancellationToken)
+                        let! affectedRows = command.ExecuteNonQueryAsync props.CancellationToken
+                        return affectedRows
+                    })
         }
 
     /// Wraps the execution of the query in a sequence
@@ -576,7 +597,7 @@ module Sql =
                 use reader = command.ExecuteReader()
                 let postgresReader = unbox<NpgsqlDataReader> reader
                 let rowReader = RowReader(postgresReader)
-                while reader.Read() do 
+                while reader.Read() do
                     yield read rowReader
             finally
                 match props.ExecutionTarget with
